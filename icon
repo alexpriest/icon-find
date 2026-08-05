@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""icon — search, preview, and fetch icons from Iconify's 300k+ open icon sets.
+
+Free, no API key, no account. Wraps api.iconify.design.
+
+  icon search <query...>        ranked hits across 230+ sets, with licenses
+  icon sheet  <query...>        render candidates to a labeled PNG grid
+  icon get    <prefix:name>...  write the SVG (stdout, or -o DIR)
+  icon sets   [term]            list / filter collections
+  icon info   <prefix>          one collection in detail
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+API = "https://api.iconify.design"
+UA = "icon-find/1.0 (+https://github.com/alexpriest)"
+
+# Alex prefers lucide. Float it, then a tier of clean general-purpose sets,
+# then everything else. Purely a display ordering — nothing is hidden.
+PREFERRED = ["lucide", "lucide-lab"]
+SECOND_TIER = [
+    "tabler", "ph", "phosphor", "heroicons", "iconoir", "mdi", "material-symbols",
+    "solar", "hugeicons", "carbon", "fluent", "ri", "bi", "mynaui", "basil",
+]
+
+# Licenses that need attribution or restrict use. Everything else is
+# permissive (MIT/ISC/Apache/CC0). Flagged so it doesn't bite later.
+ATTRIBUTION_SPDX = ("CC-BY", "CC BY", "GPL", "OFL", "MPL")
+
+# `magick -list font` is empty on stock macOS — ImageMagick ships no font
+# config here, so montage dies with "unable to read font ''" unless handed an
+# explicit file. Do not remove.
+FONT_CANDIDATES = (
+    "/System/Library/Fonts/SFNSMono.ttf",
+    "/System/Library/Fonts/Monaco.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+)
+
+
+def label_font() -> str | None:
+    return next((f for f in FONT_CANDIDATES if os.path.exists(f)), None)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"icon: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def fetch(path: str, params: dict[str, Any] | None = None, raw: bool = False):
+    url = f"{API}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = r.read()
+    except urllib.error.HTTPError as e:
+        die(f"HTTP {e.code} fetching {url}")
+    except Exception as e:  # network, DNS, timeout
+        die(f"{e} fetching {url}")
+    return body if raw else json.loads(body)
+
+
+def search_raw(query: str, limit: int = 96) -> dict[str, Any]:
+    return fetch("/search", {"query": query, "limit": min(limit, 999)})
+
+
+def license_note(coll: dict[str, Any]) -> str:
+    lic = (coll.get("license") or {}).get("title") or "?"
+    spdx = (coll.get("license") or {}).get("spdx") or lic
+    flag = " ⚠ attribution" if any(s in spdx.upper() for s in ATTRIBUTION_SPDX) else ""
+    return f"{lic}{flag}"
+
+
+def rank(icons: list[str], query: str) -> list[str]:
+    """Exact name match first, then preferred sets, then shorter names."""
+    words = [w for w in re.split(r"[\s\-_]+", query.lower()) if w]
+
+    def key(icon: str):
+        prefix, _, name = icon.partition(":")
+        nm = name.lower()
+        exact = 0 if nm == query.lower().replace(" ", "-") else 1
+        allwords = 0 if all(w in nm for w in words) else 1
+        if prefix in PREFERRED:
+            tier = 0
+        elif prefix in SECOND_TIER:
+            tier = 1
+        else:
+            tier = 2
+        return (exact, allwords, tier, len(nm), icon)
+
+    return sorted(icons, key=key)
+
+
+def do_search(query: str, limit: int, set_filter: str | None) -> tuple[list[str], dict]:
+    """Search, with automatic per-word fallback when a compound query is empty.
+
+    Iconify AND-matches words against icon NAMES. "cocktail shaker" returns 0
+    even though "cocktail" returns 49 and "shaker" returns 9 — there is simply
+    no icon named both. An empty result is therefore NEVER evidence that
+    nothing exists, so never report one without trying the words separately.
+    """
+    d = search_raw(query, limit)
+    icons, colls = d.get("icons", []), d.get("collections", {})
+    fallback: dict[str, list[str]] = {}
+
+    words = [w for w in re.split(r"[\s\-_]+", query.strip()) if w]
+    if not icons and len(words) > 1:
+        for w in words:
+            sub = search_raw(w, limit)
+            if sub.get("icons"):
+                fallback[w] = rank(sub["icons"], w)
+                colls.update(sub.get("collections", {}))
+
+    # Singular/plural retry on a single word that found nothing.
+    if not icons and not fallback and len(words) == 1:
+        w = words[0]
+        alt = w[:-1] if w.endswith("s") else w + "s"
+        sub = search_raw(alt, limit)
+        if sub.get("icons"):
+            fallback[alt] = rank(sub["icons"], alt)
+            colls.update(sub.get("collections", {}))
+
+    if set_filter:
+        keep = {s.strip() for s in set_filter.split(",")}
+        icons = [i for i in icons if i.split(":")[0] in keep]
+        fallback = {k: [i for i in v if i.split(":")[0] in keep] for k, v in fallback.items()}
+        fallback = {k: v for k, v in fallback.items() if v}
+
+    return rank(icons, query), {"collections": colls, "fallback": fallback}
+
+
+def print_results(icons: list[str], meta: dict, query: str, group: bool) -> None:
+    colls = meta["collections"]
+    fb = meta["fallback"]
+
+    if not icons and not fb:
+        print(f'No icon in any of the 230+ sets matches "{query}".')
+        print("Try a simpler or more generic word — Iconify matches icon NAMES, not concepts.")
+        print("  icon sets <term>   to browse collections instead")
+        return
+
+    if not icons and fb:
+        print(f'No single icon matches all of "{query}".')
+        print("That is a name-matching miss, not proof the concept is missing. Per word:\n")
+        for w, hits in fb.items():
+            print(f'  "{w}" — {len(hits)} hit(s)')
+            for i in hits[:8]:
+                print(f"      {i}")
+            if len(hits) > 8:
+                print(f"      … +{len(hits) - 8} more   (icon search {w})")
+            print()
+        return
+
+    print(f"{len(icons)} hit(s) for \"{query}\"\n")
+
+    if group:
+        by_set: dict[str, list[str]] = {}
+        for i in icons:
+            by_set.setdefault(i.split(":")[0], []).append(i)
+        order = sorted(
+            by_set,
+            key=lambda p: (
+                0 if p in PREFERRED else 1 if p in SECOND_TIER else 2,
+                -len(by_set[p]),
+                p,
+            ),
+        )
+        for prefix in order:
+            c = colls.get(prefix, {})
+            star = " ★" if prefix in PREFERRED else ""
+            print(f"{prefix}{star}  ({c.get('name', prefix)} · {license_note(c)})")
+            for i in by_set[prefix]:
+                print(f"    {i}")
+            print()
+    else:
+        for i in icons:
+            print(i)
+
+
+# ---------------------------------------------------------------- contact sheet
+
+def svg_bytes(icon: str, color: str, size: int) -> bytes:
+    prefix, _, name = icon.partition(":")
+    return fetch(f"/{prefix}/{name}.svg", {"color": color, "height": size}, raw=True)
+
+
+def make_sheet(icons: list[str], out: str, color: str, cell: int, cols: int) -> str:
+    if not shutil.which("rsvg-convert"):
+        die("rsvg-convert not found — brew install librsvg")
+    magick = shutil.which("magick") or shutil.which("montage")
+    if not magick:
+        die("ImageMagick not found — brew install imagemagick")
+
+    tmp = tempfile.mkdtemp(prefix="iconsheet-")
+    args: list[str] = []
+
+    def render(idx_icon):
+        idx, icon = idx_icon
+        try:
+            data = svg_bytes(icon, color, cell)
+        except SystemExit:
+            return None
+        svg_p = os.path.join(tmp, f"{idx:04d}.svg")
+        png_p = os.path.join(tmp, f"{idx:04d}.png")
+        with open(svg_p, "wb") as f:
+            f.write(data)
+        r = subprocess.run(
+            ["rsvg-convert", "-h", str(cell), "-b", "white", "-o", png_p, svg_p],
+            capture_output=True,
+        )
+        return (idx, icon, png_p) if r.returncode == 0 and os.path.exists(png_p) else None
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        rendered = [r for r in ex.map(render, enumerate(icons)) if r]
+
+    if not rendered:
+        die("nothing rendered")
+
+    # Two-line labels (set above, name below) so a long id doesn't overrun its
+    # tile and collide with its neighbour's — the default single line does.
+    pointsize = 11
+    longest = 1
+    for _, icon, png_p in sorted(rendered):
+        prefix, _, name = icon.partition(":")
+        if len(name) > 22:
+            name = name[:21] + "…"
+        longest = max(longest, len(prefix), len(name))
+        args += ["-label", f"{prefix}\n{name}", png_p]
+
+    # Mono glyphs run ~0.62em wide; pad the tile to fit the longest label.
+    tile_w = max(cell + 20, int(longest * pointsize * 0.62) + 14)
+    padx = max(6, (tile_w - cell) // 2)
+
+    font = label_font()
+    cmd = ([magick, "montage"] if magick.endswith("magick") else [magick]) + [
+        "-background", "white",
+        "-fill", "#333333",
+        *(["-font", font] if font else []),
+        "-pointsize", str(pointsize),
+        "-geometry", f"{cell}x{cell}+{padx}+8",
+        "-tile", f"{cols}x",
+        *args,
+        out,
+    ]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        die(f"montage failed: {r.stderr.decode()[:400]}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    return out
+
+
+# ---------------------------------------------------------------------- commands
+
+def cmd_search(a) -> None:
+    q = " ".join(a.query)
+    icons, meta = do_search(q, a.limit, a.set)
+    if a.json:
+        print(json.dumps({"query": q, "icons": icons, **meta}, indent=2))
+        return
+    print_results(icons[: a.top] if a.top else icons, meta, q, group=not a.flat)
+
+
+def cmd_sheet(a) -> None:
+    q = " ".join(a.query)
+    icons, meta = do_search(q, a.limit, a.set)
+    if not icons:
+        for hits in meta["fallback"].values():
+            icons.extend(hits)
+        icons = icons[: a.top]
+    if not icons:
+        die(f'nothing to render for "{q}"')
+    icons = icons[: a.top]
+    out = a.out or os.path.join(tempfile.gettempdir(), f"icons-{re.sub(r'[^a-z0-9]+', '-', q.lower())}.png")
+    make_sheet(icons, out, a.color, a.cell, a.cols)
+    print(out)
+    if a.open:
+        subprocess.run(["open", out])
+
+
+def cmd_get(a) -> None:
+    for icon in a.icons:
+        if ":" not in icon:
+            die(f'"{icon}" is not a valid id — use prefix:name (e.g. lucide:martini)')
+        data = svg_bytes(icon, a.color, a.size) if (a.color or a.size) else svg_bytes(icon, None, None)
+        if a.out:
+            os.makedirs(a.out, exist_ok=True)
+            name = icon.split(":", 1)[1] + ".svg"
+            path = os.path.join(a.out, name)
+            with open(path, "wb") as f:
+                f.write(data)
+            print(path)
+        else:
+            sys.stdout.write(data.decode() + "\n")
+
+
+def cmd_sets(a) -> None:
+    d = fetch("/collections")
+    term = (a.term or "").lower()
+    rows = []
+    for prefix, c in d.items():
+        hay = f"{prefix} {c.get('name','')} {c.get('category','')} {' '.join(c.get('tags',[]))}".lower()
+        if term and term not in hay:
+            continue
+        rows.append((prefix, c))
+    rows.sort(key=lambda r: (0 if r[0] in PREFERRED else 1 if r[0] in SECOND_TIER else 2, -r[1].get("total", 0)))
+    if a.json:
+        print(json.dumps({p: c for p, c in rows}, indent=2))
+        return
+    total = sum(c.get("total", 0) for _, c in rows)
+    print(f"{len(rows)} collection(s), {total:,} icons\n")
+    for prefix, c in rows:
+        star = " ★" if prefix in PREFERRED else ""
+        print(f"{prefix:<26}{star:<2} {c.get('total',0):>6}  {c.get('name','')[:34]:<36} {license_note(c)}")
+
+
+def cmd_info(a) -> None:
+    d = fetch("/collections")
+    c = d.get(a.prefix)
+    if not c:
+        near = [p for p in d if a.prefix.lower() in p.lower()]
+        die(f'no collection "{a.prefix}"' + (f"  — did you mean: {', '.join(near[:8])}" if near else ""))
+    print(f"{a.prefix}  —  {c.get('name')}")
+    print(f"  icons     {c.get('total', 0):,}")
+    print(f"  license   {license_note(c)}")
+    print(f"  author    {(c.get('author') or {}).get('name', '?')}")
+    print(f"  category  {c.get('category', '—')}")
+    if c.get("tags"):
+        print(f"  tags      {', '.join(c['tags'])}")
+    if c.get("samples"):
+        print(f"  samples   {', '.join(a.prefix + ':' + s for s in c['samples'])}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="icon", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("search", help="search all sets")
+    s.add_argument("query", nargs="+")
+    s.add_argument("--limit", type=int, default=96, help="API result cap (default 96, max 999)")
+    s.add_argument("--top", type=int, default=0, help="show only the first N ranked hits")
+    s.add_argument("--set", help="restrict to comma-separated set prefixes")
+    s.add_argument("--flat", action="store_true", help="bare ids, one per line")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_search)
+
+    s = sub.add_parser("sheet", help="render candidates to a labeled PNG grid")
+    s.add_argument("query", nargs="+")
+    s.add_argument("-o", "--out", help="output PNG path")
+    s.add_argument("--top", type=int, default=48, help="max icons on the sheet (default 48)")
+    s.add_argument("--limit", type=int, default=96)
+    s.add_argument("--set", help="restrict to comma-separated set prefixes")
+    s.add_argument("--color", default="#111111")
+    s.add_argument("--cell", type=int, default=64, help="icon px (default 64)")
+    s.add_argument("--cols", type=int, default=8)
+    s.add_argument("--open", action="store_true", help="open the sheet when done")
+    s.set_defaults(func=cmd_sheet)
+
+    s = sub.add_parser("get", help="fetch SVG(s)")
+    s.add_argument("icons", nargs="+", metavar="prefix:name")
+    s.add_argument("-o", "--out", help="directory to write into (default: stdout)")
+    s.add_argument("--color", help="hex color to bake in (default: keeps currentColor)")
+    s.add_argument("--size", type=int, help="px height to bake in (default: 1em, scalable)")
+    s.set_defaults(func=cmd_get)
+
+    s = sub.add_parser("sets", help="list collections")
+    s.add_argument("term", nargs="?", help="filter by name/category/tag")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_sets)
+
+    s = sub.add_parser("info", help="detail on one collection")
+    s.add_argument("prefix")
+    s.set_defaults(func=cmd_info)
+
+    a = p.parse_args()
+    a.func(a)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        os._exit(0)
