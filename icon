@@ -146,48 +146,55 @@ def print_results(icons: list[str], meta: dict, query: str, group: bool) -> None
     colls = meta["collections"]
     fb = meta["fallback"]
 
+    # --flat is meant for piping: bare ids on stdout, every diagnostic on stderr,
+    # so `icon search x --flat | ...` never ingests prose.
+    out = sys.stdout if group else sys.stderr
+
     if not icons and not fb:
-        print(f'No icon in any of the 230+ sets matches "{query}".')
-        print("Try a simpler or more generic word — Iconify matches icon NAMES, not concepts.")
-        print("  icon sets <term>   to browse collections instead")
+        print(f'No icon in any of the 231 sets matches "{query}".', file=out)
+        print("That is a NAME miss — Iconify matches icon names, not concepts. It is not", file=out)
+        print("proof the idea is unrepresentable. Try a more generic word, or a visual", file=out)
+        print("synonym for the thing (wormwood → herb, leaf, sprig).", file=out)
+        print("  icon sets <term>   to browse collections instead", file=out)
         return
 
     if not icons and fb:
-        print(f'No single icon matches all of "{query}".')
-        print("That is a name-matching miss, not proof the concept is missing. Per word:\n")
+        print(f'No single icon matches all of "{query}".', file=out)
+        print("That is a name-matching miss, not proof the concept is missing. Per word:\n", file=out)
         for w, hits in fb.items():
-            print(f'  "{w}" — {len(hits)} hit(s)')
+            print(f'  "{w}" — {len(hits)} hit(s)', file=out)
             for i in hits[:8]:
-                print(f"      {i}")
+                print(f"      {i}", file=out)
             if len(hits) > 8:
-                print(f"      … +{len(hits) - 8} more   (icon search {w})")
-            print()
+                print(f"      … +{len(hits) - 8} more   (icon search {w})", file=out)
+            print(file=out)
         return
 
-    print(f"{len(icons)} hit(s) for \"{query}\"\n")
-
-    if group:
-        by_set: dict[str, list[str]] = {}
-        for i in icons:
-            by_set.setdefault(i.split(":")[0], []).append(i)
-        order = sorted(
-            by_set,
-            key=lambda p: (
-                0 if p in PREFERRED else 1 if p in SECOND_TIER else 2,
-                -len(by_set[p]),
-                p,
-            ),
-        )
-        for prefix in order:
-            c = colls.get(prefix, {})
-            star = " ★" if prefix in PREFERRED else ""
-            print(f"{prefix}{star}  ({c.get('name', prefix)} · {license_note(c)})")
-            for i in by_set[prefix]:
-                print(f"    {i}")
-            print()
-    else:
+    if not group:
         for i in icons:
             print(i)
+        return
+
+    print(f'{len(icons)} hit(s) for "{query}"\n')
+
+    by_set: dict[str, list[str]] = {}
+    for i in icons:
+        by_set.setdefault(i.split(":")[0], []).append(i)
+    order = sorted(
+        by_set,
+        key=lambda p: (
+            0 if p in PREFERRED else 1 if p in SECOND_TIER else 2,
+            -len(by_set[p]),
+            p,
+        ),
+    )
+    for prefix in order:
+        c = colls.get(prefix, {})
+        star = " ★" if prefix in PREFERRED else ""
+        print(f"{prefix}{star}  ({c.get('name', prefix)} · {license_note(c)})")
+        for i in by_set[prefix]:
+            print(f"    {i}")
+        print()
 
 
 # ---------------------------------------------------------------- contact sheet
@@ -274,6 +281,28 @@ def cmd_search(a) -> None:
 
 
 def cmd_sheet(a) -> None:
+    # Explicit ids instead of a query — `icon sheet lucide:martini ph:beer-bottle`,
+    # or `icon search x --flat | icon sheet -`. No search term contains a colon,
+    # so the two modes can't be confused.
+    if a.query == ["-"]:
+        ids = [ln.strip() for ln in sys.stdin if ln.strip()]
+        if not ids:
+            die("no icon ids on stdin")
+        out = a.out or os.path.join(tempfile.gettempdir(), "icons-stdin.png")
+        make_sheet(ids[: a.top], out, a.color, a.cell, a.cols)
+        print(out)
+        if a.open:
+            subprocess.run(["open", out])
+        return
+
+    if any(":" in q for q in a.query):
+        out = a.out or os.path.join(tempfile.gettempdir(), "icons-selection.png")
+        make_sheet(a.query[: a.top], out, a.color, a.cell, a.cols)
+        print(out)
+        if a.open:
+            subprocess.run(["open", out])
+        return
+
     q = " ".join(a.query)
     icons, meta = do_search(q, a.limit, a.set)
     if not icons:

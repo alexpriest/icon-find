@@ -21,7 +21,7 @@ Same capability, no standing context tax.
 | | |
 |---|---|
 | `icon search <query…>` | Search all sets. Grouped by collection, license shown, lucide floated to the top. `--set lucide,tabler` to restrict, `--top N`, `--flat` for bare ids, `--json`. |
-| `icon sheet <query…>` | Render up to `--top` (default 48) candidates into one labeled PNG grid. `--open` to view, `-o` for the path, `--cols`, `--cell`, `--color`. |
+| `icon sheet <query…>` | Render up to `--top` (default 48) candidates into one labeled PNG grid. `--open` to view, `-o` for the path, `--cols`, `--cell`, `--color`. Also takes explicit ids (`icon sheet lucide:martini ph:beer-bottle`) or `-` to read ids from stdin, so `icon search x --flat \| icon sheet -` composes. |
 | `icon get <prefix:name>…` | Print the SVG to stdout, or `-o DIR` to write `<name>.svg`. `--color` bakes a hex fill, `--size` bakes a px height. |
 | `icon sets [term]` | List collections — count, name, license. Filter by name/category/tag. |
 | `icon info <prefix>` | One collection in detail, with sample icon ids. |
