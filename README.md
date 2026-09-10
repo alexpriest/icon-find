@@ -1,8 +1,14 @@
-# icon — 317k open-source icons from the command line
+# icon
 
-Wraps [Iconify](https://iconify.design)'s public API. **231 icon sets, 317,631 icons, free, no API key, no account.**
-Built 2026-08-05 as the alternative to a Noun Project API subscription ($25/mo minimum,
-separate from the Pro download subscription).
+Searches 317,000 open-source icons from the command line and renders the candidates as a grid to look at.
+
+## Status
+
+Shipped — wraps Iconify’s public API; no key and no account needed.
+
+## License
+
+Not licensed for reuse.
 
 ```sh
 icon search cocktail              # ranked hits across every set, with licenses
